@@ -277,7 +277,7 @@ func (c *Container) Upload(_ context.Context, name string, r io.Reader) error {
 	}
 	var file io.WriteCloser
 	if size >= c.chunkSize {
-		file, err = c.connection.StaticLargeObjectCreateFile(&swift.LargeObjectOpts{
+		file, err = c.connection.DynamicLargeObjectCreateFile(&swift.LargeObjectOpts{
 			Container:        c.name,
 			ObjectName:       name,
 			ChunkSize:        c.chunkSize,
