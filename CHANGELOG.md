@@ -11,6 +11,11 @@ We use *breaking :warning:* to mark changes that are not backward compatible (re
 
 ## Unreleased
 
+### Changed
+- [#2732](https://github.com/thanos-io/thanos/pull/2732) Swift: Switched to a new library [ncw/swift](https://github.com/ncw/swift) providing large objects support.
+   By default, segments will be uploaded to the same container directory `segments/` if the file is bigger than `1GB`.
+   To change the defaults see [the docs](./docs/storage.md#openstack-swift).
+
 ## [v0.16.0](https://github.com/thanos-io/thanos/releases) - 2020.10.26
 
 Highlights:

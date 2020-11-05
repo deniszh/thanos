@@ -36,6 +36,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
 	"github.com/thanos-io/thanos/pkg/logging"
+	"github.com/thanos-io/thanos/pkg/model"
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/objstore/client"
 	"github.com/thanos-io/thanos/pkg/prober"
@@ -51,18 +52,12 @@ import (
 const extpromPrefix = "thanos_bucket_"
 
 var (
-	issuesMap = map[string]verifier.Issue{
-		verifier.IndexIssueID:                verifier.IndexIssue,
-		verifier.OverlappedBlocksIssueID:     verifier.OverlappedBlocksIssue,
-		verifier.DuplicatedCompactionIssueID: verifier.DuplicatedCompactionIssue,
-	}
-	allIssues = func() (s []string) {
-		for id := range issuesMap {
-			s = append(s, id)
-		}
-
-		sort.Strings(s)
-		return s
+	issuesVerifiersRegistry = verifier.Registry{
+		Verifiers: []verifier.Verifier{verifier.OverlappedBlocksIssue{}},
+		VerifierRepairers: []verifier.VerifierRepairer{
+			verifier.IndexKnownIssues{},
+			verifier.DuplicatedCompactionBlocks{},
+		},
 	}
 	inspectColumns = []string{"ULID", "FROM", "UNTIL", "RANGE", "UNTIL-DOWN", "#SERIES", "#SAMPLES", "#CHUNKS", "COMP-LEVEL", "COMP-FAILED", "LABELS", "RESOLUTION", "SOURCE"}
 )
@@ -70,7 +65,7 @@ var (
 func registerBucket(app extkingpin.AppClause) {
 	cmd := app.Command("bucket", "Bucket utility commands")
 
-	objStoreConfig := regCommonObjStoreFlags(cmd, "", true)
+	objStoreConfig := extkingpin.RegisterCommonObjStoreFlags(cmd, "", true)
 	registerBucketVerify(cmd, objStoreConfig)
 	registerBucketLs(cmd, objStoreConfig)
 	registerBucketInspect(cmd, objStoreConfig)
@@ -81,15 +76,17 @@ func registerBucket(app extkingpin.AppClause) {
 }
 
 func registerBucketVerify(app extkingpin.AppClause, objStoreConfig *extflag.PathOrContent) {
-	cmd := app.Command("verify", "Verify all blocks in the bucket against specified issues")
-	objStoreBackupConfig := regCommonObjStoreFlags(cmd, "-backup", false, "Used for repair logic to backup blocks before removal.")
+	cmd := app.Command("verify", "Verify all blocks in the bucket against specified issues. NOTE: Depending on issue this might take time and will need downloading all specified blocks to disk.")
+	objStoreBackupConfig := extkingpin.RegisterCommonObjStoreFlags(cmd, "-backup", false, "Used for repair logic to backup blocks before removal.")
 	repair := cmd.Flag("repair", "Attempt to repair blocks for which issues were detected").
 		Short('r').Default("false").Bool()
-	issuesToVerify := cmd.Flag("issues", fmt.Sprintf("Issues to verify (and optionally repair). Possible values: %v", allIssues())).
-		Short('i').Default(verifier.IndexIssueID, verifier.OverlappedBlocksIssueID).Strings()
+	issuesToVerify := cmd.Flag("issues", fmt.Sprintf("Issues to verify (and optionally repair). "+
+		"Possible issue to verify, without repair: %v; Possible issue to verify and repair: %v",
+		issuesVerifiersRegistry.VerifiersIDs(), issuesVerifiersRegistry.VerifierRepairersIDs())).
+		Short('i').Default(verifier.IndexKnownIssues{}.IssueID(), verifier.OverlappedBlocksIssue{}.IssueID()).Strings()
 	ids := cmd.Flag("id", "Block IDs to verify (and optionally repair) only. "+
 		"If none is specified, all blocks will be verified. Repeated field").Strings()
-	deleteDelay := modelDuration(cmd.Flag("delete-delay", "Duration after which blocks marked for deletion would be deleted permanently from source bucket by compactor component. "+
+	deleteDelay := extkingpin.ModelDuration(cmd.Flag("delete-delay", "Duration after which blocks marked for deletion would be deleted permanently from source bucket by compactor component. "+
 		"If delete-delay is non zero, blocks will be marked for deletion and compactor component is required to delete blocks from source bucket. "+
 		"If delete-delay is 0, blocks will be deleted straight away. Use this if you want to get rid of or move the block immediately. "+
 		"Note that deleting blocks immediately can cause query failures, if store gateway still has the block loaded, "+
@@ -130,18 +127,9 @@ func registerBucketVerify(app extkingpin.AppClause, objStoreConfig *extflag.Path
 		// Dummy actor to immediately kill the group after the run function returns.
 		g.Add(func() error { return nil }, func(error) {})
 
-		var (
-			ctx    = context.Background()
-			v      *verifier.Verifier
-			issues []verifier.Issue
-		)
-
-		for _, i := range *issuesToVerify {
-			issueFn, ok := issuesMap[i]
-			if !ok {
-				return errors.Errorf("no such issue name %s", i)
-			}
-			issues = append(issues, issueFn)
+		r, err := issuesVerifiersRegistry.SubstractByIDs(*issuesToVerify, *repair)
+		if err != nil {
+			return err
 		}
 
 		fetcher, err := block.NewMetaFetcher(logger, fetcherConcurrency, bkt, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg), nil, nil)
@@ -149,11 +137,14 @@ func registerBucketVerify(app extkingpin.AppClause, objStoreConfig *extflag.Path
 			return err
 		}
 
-		if *repair {
-			v = verifier.NewWithRepair(logger, reg, bkt, backupBkt, fetcher, time.Duration(*deleteDelay), issues)
-		} else {
-			v = verifier.New(logger, reg, bkt, fetcher, time.Duration(*deleteDelay), issues)
-		}
+		ctx := context.Background()
+		v := verifier.NewManager(reg, verifier.Config{
+			Logger:      logger,
+			Bkt:         bkt,
+			BackupBkt:   backupBkt,
+			Fetcher:     fetcher,
+			DeleteDelay: time.Duration(*deleteDelay),
+		}, r)
 
 		var idMatcher func(ulid.ULID) bool = nil
 		if len(*ids) > 0 {
@@ -161,7 +152,7 @@ func registerBucketVerify(app extkingpin.AppClause, objStoreConfig *extflag.Path
 			for _, bid := range *ids {
 				id, err := ulid.Parse(bid)
 				if err != nil {
-					return errors.Wrap(err, "invalid ULID found in --id-allowlist flag")
+					return errors.Wrap(err, "invalid ULID found in --id flag")
 				}
 				idsMap[id.String()] = struct{}{}
 			}
@@ -172,6 +163,10 @@ func registerBucketVerify(app extkingpin.AppClause, objStoreConfig *extflag.Path
 				}
 				return true
 			}
+		}
+
+		if *repair {
+			return v.VerifyAndRepair(ctx, idMatcher)
 		}
 
 		return v.Verify(ctx, idMatcher)
@@ -324,7 +319,7 @@ func registerBucketInspect(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 // registerBucketWeb exposes a web interface for the state of remote store like `pprof web`.
 func registerBucketWeb(app extkingpin.AppClause, objStoreConfig *extflag.PathOrContent) {
 	cmd := app.Command("web", "Web interface for remote storage bucket")
-	httpBindAddr, httpGracePeriod := regHTTPFlags(cmd)
+	httpBindAddr, httpGracePeriod := extkingpin.RegisterHTTPFlags(cmd)
 	webExternalPrefix := cmd.Flag("web.external-prefix", "Static prefix for all HTML links and redirect URLs in the bucket web UI interface. Actual endpoints are still served on / or the web.route-prefix. This allows thanos bucket web UI to be served behind a reverse proxy that strips a URL sub-path.").Default("").String()
 	webPrefixHeaderName := cmd.Flag("web.prefix-header", "Name of HTTP request header used for dynamic prefixing of UI links and redirects. This option is ignored if web.external-prefix argument is set. Security risk: enable this option only if a reverse proxy in front of thanos is resetting the header. The --web.prefix-header=X-Forwarded-Prefix option can be useful, for example, if Thanos UI is served via Traefik reverse proxy with PathPrefixStrip option enabled, which sends the stripped prefix value in X-Forwarded-Prefix header. This allows thanos UI to be served on a sub-path.").Default("").String()
 	interval := cmd.Flag("refresh", "Refresh interval to download metadata from remote storage").Default("30m").Duration()
@@ -441,12 +436,16 @@ func listResLevel() []string {
 
 func registerBucketReplicate(app extkingpin.AppClause, objStoreConfig *extflag.PathOrContent) {
 	cmd := app.Command("replicate", fmt.Sprintf("Replicate data from one object storage to another. NOTE: Currently it works only with Thanos blocks (%v has to have Thanos metadata).", block.MetaFilename))
-	httpBindAddr, httpGracePeriod := regHTTPFlags(cmd)
-	toObjStoreConfig := regCommonObjStoreFlags(cmd, "-to", false, "The object storage which replicate data to.")
+	httpBindAddr, httpGracePeriod := extkingpin.RegisterHTTPFlags(cmd)
+	toObjStoreConfig := extkingpin.RegisterCommonObjStoreFlags(cmd, "-to", false, "The object storage which replicate data to.")
 	resolutions := cmd.Flag("resolution", "Only blocks with these resolutions will be replicated. Repeated flag.").Default("0s", "5m", "1h").HintAction(listResLevel).DurationList()
 	compactions := cmd.Flag("compaction", "Only blocks with these compaction levels will be replicated. Repeated flag.").Default("1", "2", "3", "4").Ints()
 	matcherStrs := cmd.Flag("matcher", "Only blocks whose external labels exactly match this matcher will be replicated.").PlaceHolder("key=\"value\"").Strings()
 	singleRun := cmd.Flag("single-run", "Run replication only one time, then exit.").Default("false").Bool()
+	minTime := model.TimeOrDuration(cmd.Flag("min-time", "Start of time range limit to replicate. Thanos Replicate will replicate only metrics, which happened later than this value. Option can be a constant time in RFC3339 format or time duration relative to current time, such as -1d or 2h45m. Valid duration units are ms, s, m, h, d, w, y.").
+		Default("0000-01-01T00:00:00Z"))
+	maxTime := model.TimeOrDuration(cmd.Flag("max-time", "End of time range limit to replicate. Thanos Replicate will replicate only metrics, which happened earlier than this value. Option can be a constant time in RFC3339 format or time duration relative to current time, such as -1d or 2h45m. Valid duration units are ms, s, m, h, d, w, y.").
+		Default("9999-12-31T23:59:59Z"))
 
 	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
 		matchers, err := replicate.ParseFlagMatchers(*matcherStrs)
@@ -472,13 +471,15 @@ func registerBucketReplicate(app extkingpin.AppClause, objStoreConfig *extflag.P
 			objStoreConfig,
 			toObjStoreConfig,
 			*singleRun,
+			minTime,
+			maxTime,
 		)
 	})
 }
 
 func registerBucketDownsample(app extkingpin.AppClause, objStoreConfig *extflag.PathOrContent) {
 	cmd := app.Command(component.Downsample.String(), "continuously downsamples blocks in an object store bucket")
-	httpAddr, httpGracePeriod := regHTTPFlags(cmd)
+	httpAddr, httpGracePeriod := extkingpin.RegisterHTTPFlags(cmd)
 	dataDir := cmd.Flag("data-dir", "Data directory in which to cache blocks and process downsamplings.").
 		Default("./data").String()
 
@@ -494,7 +495,7 @@ func registerBucketCleanup(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 		Default("30m").Duration()
 	blockSyncConcurrency := cmd.Flag("block-sync-concurrency", "Number of goroutines to use when syncing block metadata from object storage.").
 		Default("20").Int()
-	selectorRelabelConf := regSelectorRelabelFlags(cmd)
+	selectorRelabelConf := extkingpin.RegisterSelectorRelabelFlags(cmd)
 	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, _ opentracing.Tracer, _ <-chan struct{}, _ bool) error {
 		confContentYaml, err := objStoreConfig.Content()
 		if err != nil {

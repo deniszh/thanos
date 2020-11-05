@@ -226,13 +226,13 @@ func newBucketStoreMetrics(reg prometheus.Registerer) *bucketStoreMetrics {
 
 	m.seriesFetchDuration = promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
 		Name:    "thanos_bucket_store_cached_series_fetch_duration_seconds",
-		Help:    "Time it takes to fetch series from a bucket to respond a query. It also includes the time it takes to cache fetch and store operations.",
+		Help:    "The time it takes to fetch series to respond to a request sent to a store gateway. It includes both the time to fetch it from the cache and from storage in case of cache misses.",
 		Buckets: []float64{0.001, 0.01, 0.1, 0.3, 0.6, 1, 3, 6, 9, 20, 30, 60, 90, 120},
 	})
 
 	m.postingsFetchDuration = promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
 		Name:    "thanos_bucket_store_cached_postings_fetch_duration_seconds",
-		Help:    "Time it takes to fetch postings from a bucket to respond a query. It also includes the time it takes to cache fetch and store operations.",
+		Help:    "The time it takes to fetch postings to respond to a request sent to a store gateway. It includes both the time to fetch it from the cache and from storage in case of cache misses.",
 		Buckets: []float64{0.001, 0.01, 0.1, 0.3, 0.6, 1, 3, 6, 9, 20, 30, 60, 90, 120},
 	})
 
@@ -273,7 +273,7 @@ type BucketStore struct {
 	partitioner          partitioner
 
 	filterConfig             *FilterConfig
-	advLabelSets             []storepb.LabelSet
+	advLabelSets             []labelpb.ZLabelSet
 	enableCompatibilityLabel bool
 
 	// Reencode postings using diff+varint+snappy when storing to cache.
@@ -412,10 +412,10 @@ func (s *BucketStore) SyncBlocks(ctx context.Context) error {
 	// Sync advertise labels.
 	var storeLabels labels.Labels
 	s.mtx.Lock()
-	s.advLabelSets = make([]storepb.LabelSet, 0, len(s.advLabelSets))
+	s.advLabelSets = make([]labelpb.ZLabelSet, 0, len(s.advLabelSets))
 	for _, bs := range s.blockSets {
 		storeLabels = storeLabels[:0]
-		s.advLabelSets = append(s.advLabelSets, storepb.LabelSet{Labels: labelpb.LabelsFromPromLabels(append(storeLabels, bs.labels...))})
+		s.advLabelSets = append(s.advLabelSets, labelpb.ZLabelSet{Labels: labelpb.ZLabelsFromPromLabels(append(storeLabels, bs.labels...))})
 	}
 	sort.Slice(s.advLabelSets, func(i, j int) bool {
 		return strings.Compare(s.advLabelSets[i].String(), s.advLabelSets[j].String()) < 0
@@ -604,7 +604,7 @@ func (s *BucketStore) Info(context.Context, *storepb.InfoRequest) (*storepb.Info
 	if s.enableCompatibilityLabel && len(res.LabelSets) > 0 {
 		// This is for compatibility with Querier v0.7.0.
 		// See query.StoreCompatibilityTypeLabelName comment for details.
-		res.LabelSets = append(res.LabelSets, storepb.LabelSet{Labels: []storepb.Label{{Name: CompatibilityTypeLabelName, Value: "store"}}})
+		res.LabelSets = append(res.LabelSets, labelpb.ZLabelSet{Labels: []labelpb.ZLabel{{Name: CompatibilityTypeLabelName, Value: "store"}}})
 	}
 	return res, nil
 }
@@ -704,51 +704,50 @@ func blockSeries(
 		chks []chunks.Meta
 	)
 	for _, id := range ps {
-		if err := indexr.LoadedSeries(id, &lset, &chks); err != nil {
+		if err := indexr.LoadedSeries(id, &lset, &chks, req); err != nil {
 			return nil, nil, errors.Wrap(err, "read series")
 		}
-		s := seriesEntry{
-			lset: make(labels.Labels, 0, len(lset)+len(extLset)),
-			refs: make([]uint64, 0, len(chks)),
-			chks: make([]storepb.AggrChunk, 0, len(chks)),
-		}
-		for _, l := range lset {
-			// Skip if the external labels of the block overrule the series' label.
-			// NOTE(fabxc): maybe move it to a prefixed version to still ensure uniqueness of series?
-			if extLset[l.Name] != "" {
-				continue
-			}
-			s.lset = append(s.lset, l)
-		}
-		for ln, lv := range extLset {
-			s.lset = append(s.lset, labels.Label{Name: ln, Value: lv})
-		}
-		sort.Sort(s.lset)
+		if len(chks) > 0 {
+			s := seriesEntry{lset: make(labels.Labels, 0, len(lset)+len(extLset))}
+			if !req.SkipChunks {
+				s.refs = make([]uint64, 0, len(chks))
+				s.chks = make([]storepb.AggrChunk, 0, len(chks))
+				for _, meta := range chks {
+					if err := chunkr.addPreload(meta.Ref); err != nil {
+						return nil, nil, errors.Wrap(err, "add chunk preload")
+					}
+					s.chks = append(s.chks, storepb.AggrChunk{
+						MinTime: meta.MinTime,
+						MaxTime: meta.MaxTime,
+					})
+					s.refs = append(s.refs, meta.Ref)
+				}
 
-		for _, meta := range chks {
-			if meta.MaxTime < req.MinTime {
-				continue
-			}
-			if meta.MinTime > req.MaxTime {
-				break
+				// Reserve chunksLimiter if we save chunks.
+				if err := chunksLimiter.Reserve(uint64(len(s.chks))); err != nil {
+					return nil, nil, errors.Wrap(err, "exceeded chunks limit")
+				}
 			}
 
-			if err := chunkr.addPreload(meta.Ref); err != nil {
-				return nil, nil, errors.Wrap(err, "add chunk preload")
+			for _, l := range lset {
+				// Skip if the external labels of the block overrule the series' label.
+				// NOTE(fabxc): maybe move it to a prefixed version to still ensure uniqueness of series?
+				if extLset[l.Name] != "" {
+					continue
+				}
+				s.lset = append(s.lset, l)
 			}
-			s.chks = append(s.chks, storepb.AggrChunk{
-				MinTime: meta.MinTime,
-				MaxTime: meta.MaxTime,
-			})
-			s.refs = append(s.refs, meta.Ref)
-		}
-		if len(s.chks) > 0 {
-			if err := chunksLimiter.Reserve(uint64(len(s.chks))); err != nil {
-				return nil, nil, errors.Wrap(err, "exceeded chunks limit")
+			for ln, lv := range extLset {
+				s.lset = append(s.lset, labels.Label{Name: ln, Value: lv})
 			}
+			sort.Sort(s.lset)
 
 			res = append(res, s)
 		}
+	}
+
+	if req.SkipChunks {
+		return newBucketSeriesSet(res), indexr.stats, nil
 	}
 
 	// Preload all chunks that were marked in the previous stage.
@@ -920,13 +919,16 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_Serie
 				resHints.AddQueriedBlock(b.meta.ULID)
 			}
 
+			var chunkr *bucketChunkReader
 			// We must keep the readers open until all their data has been sent.
 			indexr := b.indexReader(gctx)
-			chunkr := b.chunkReader(gctx)
+			if !req.SkipChunks {
+				chunkr = b.chunkReader(gctx)
+				defer runutil.CloseWithLogOnErr(s.logger, chunkr, "series block")
+			}
 
 			// Defer all closes to the end of Series method.
 			defer runutil.CloseWithLogOnErr(s.logger, indexr, "series block")
-			defer runutil.CloseWithLogOnErr(s.logger, chunkr, "series block")
 
 			g.Go(func() error {
 				part, pstats, err := blockSeries(
@@ -1015,7 +1017,7 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_Serie
 				stats.mergedChunksCount += len(series.Chunks)
 				s.metrics.chunkSizeBytes.Observe(float64(chunksSize(series.Chunks)))
 			}
-			series.Labels = labelpb.LabelsFromPromLabels(lset)
+			series.Labels = labelpb.ZLabelsFromPromLabels(lset)
 			if err = srv.Send(storepb.NewSeriesResponse(&series)); err != nil {
 				err = status.Error(codes.Unknown, errors.Wrap(err, "send series response").Error())
 				return
@@ -1330,7 +1332,17 @@ func newBucketBlock(
 	})
 	sort.Sort(b.relabelLabels)
 
-	// Get object handles for all chunk files.
+	// Get object handles for all chunk files (segment files) from meta.json, if available.
+	if len(meta.Thanos.SegmentFiles) > 0 {
+		b.chunkObjs = make([]string, 0, len(meta.Thanos.SegmentFiles))
+
+		for _, sf := range meta.Thanos.SegmentFiles {
+			b.chunkObjs = append(b.chunkObjs, path.Join(meta.ULID.String(), block.ChunksDirname, sf))
+		}
+		return b, nil
+	}
+
+	// Get object handles for all chunk files from storage.
 	if err = bkt.Iter(ctx, path.Join(meta.ULID.String(), block.ChunksDirname), func(n string) error {
 		b.chunkObjs = append(b.chunkObjs, n)
 		return nil
@@ -1367,6 +1379,11 @@ func (b *bucketBlock) readChunkRange(ctx context.Context, seq int, off, length i
 	if err != nil {
 		return nil, errors.Wrap(err, "allocate chunk bytes")
 	}
+
+	if seq < 0 || seq >= len(b.chunkObjs) {
+		return nil, errors.Errorf("unknown segment file for index %d", seq)
+	}
+
 	buf := bytes.NewBuffer(*c)
 
 	r, err := b.bkt.GetRange(ctx, b.chunkObjs[seq], off, length)
@@ -1973,7 +1990,8 @@ func (g gapBasedPartitioner) Partition(length int, rng func(int) (uint64, uint64
 // LoadedSeries populates the given labels and chunk metas for the series identified
 // by the reference.
 // Returns ErrNotFound if the ref does not resolve to a known series.
-func (r *bucketIndexReader) LoadedSeries(ref uint64, lset *labels.Labels, chks *[]chunks.Meta) error {
+func (r *bucketIndexReader) LoadedSeries(ref uint64, lset *labels.Labels, chks *[]chunks.Meta,
+	req *storepb.SeriesRequest) error {
 	b, ok := r.loadedSeries[ref]
 	if !ok {
 		return errors.Errorf("series %d not found", ref)
@@ -1982,13 +2000,103 @@ func (r *bucketIndexReader) LoadedSeries(ref uint64, lset *labels.Labels, chks *
 	r.stats.seriesTouched++
 	r.stats.seriesTouchedSizeSum += len(b)
 
-	return r.dec.Series(b, lset, chks)
+	return r.decodeSeriesWithReq(b, lset, chks, req)
 }
 
 // Close released the underlying resources of the reader.
 func (r *bucketIndexReader) Close() error {
 	r.block.pendingReaders.Done()
 	return nil
+}
+
+// decodeSeriesWithReq decodes a series entry from the given byte slice based on the SeriesRequest.
+func (r *bucketIndexReader) decodeSeriesWithReq(b []byte, lbls *labels.Labels, chks *[]chunks.Meta,
+	req *storepb.SeriesRequest) error {
+	*lbls = (*lbls)[:0]
+	*chks = (*chks)[:0]
+
+	d := encoding.Decbuf{B: b}
+
+	k := d.Uvarint()
+
+	for i := 0; i < k; i++ {
+		lno := uint32(d.Uvarint())
+		lvo := uint32(d.Uvarint())
+
+		if d.Err() != nil {
+			return errors.Wrap(d.Err(), "read series label offsets")
+		}
+
+		ln, err := r.dec.LookupSymbol(lno)
+		if err != nil {
+			return errors.Wrap(err, "lookup label name")
+		}
+		lv, err := r.dec.LookupSymbol(lvo)
+		if err != nil {
+			return errors.Wrap(err, "lookup label value")
+		}
+
+		*lbls = append(*lbls, labels.Label{Name: ln, Value: lv})
+	}
+
+	// Read the chunks meta data.
+	k = d.Uvarint()
+
+	if k == 0 {
+		return nil
+	}
+
+	t0 := d.Varint64()
+	maxt := int64(d.Uvarint64()) + t0
+	ref0 := int64(d.Uvarint64())
+
+	// No chunk in the required time range.
+	if t0 > req.MaxTime {
+		return nil
+	}
+
+	if req.MinTime <= maxt {
+		*chks = append(*chks, chunks.Meta{
+			Ref:     uint64(ref0),
+			MinTime: t0,
+			MaxTime: maxt,
+		})
+		// Get a valid chunk, return if it is a skip chunk request.
+		if req.SkipChunks {
+			return nil
+		}
+	}
+	t0 = maxt
+
+	for i := 1; i < k; i++ {
+		mint := int64(d.Uvarint64()) + t0
+		maxt := int64(d.Uvarint64()) + mint
+
+		if maxt < req.MinTime {
+			continue
+		}
+		if mint > req.MaxTime {
+			break
+		}
+
+		ref0 += d.Varint64()
+		t0 = maxt
+
+		if d.Err() != nil {
+			return errors.Wrapf(d.Err(), "read meta for chunk %d", i)
+		}
+
+		*chks = append(*chks, chunks.Meta{
+			Ref:     uint64(ref0),
+			MinTime: mint,
+			MaxTime: maxt,
+		})
+
+		if req.SkipChunks {
+			return nil
+		}
+	}
+	return d.Err()
 }
 
 type bucketChunkReader struct {

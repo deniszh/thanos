@@ -195,8 +195,10 @@ func TestGroup_Compact_e2e(t *testing.T) {
 		comp, err := tsdb.NewLeveledCompactor(ctx, reg, logger, []int64{1000, 3000}, nil)
 		testutil.Ok(t, err)
 
+		planner := NewTSDBBasedPlanner(logger, []int64{1000, 3000})
+
 		grouper := NewDefaultGrouper(logger, bkt, false, false, reg, blocksMarkedForDeletion, garbageCollectedBlocks)
-		bComp, err := NewBucketCompactor(logger, sy, grouper, comp, dir, bkt, 2)
+		bComp, err := NewBucketCompactor(logger, sy, grouper, planner, comp, dir, bkt, 2)
 		testutil.Ok(t, err)
 
 		// Compaction on empty should not fail.
@@ -368,6 +370,7 @@ func TestGroup_Compact_e2e(t *testing.T) {
 			// Check thanos meta.
 			testutil.Assert(t, labels.Equal(extLabels, labels.FromMap(meta.Thanos.Labels)), "ext labels does not match")
 			testutil.Equals(t, int64(124), meta.Thanos.Downsample.Resolution)
+			testutil.Assert(t, len(meta.Thanos.SegmentFiles) > 0, "compacted blocks have segment files set")
 		}
 		{
 			meta, ok := others[defaultGroupKey(124, extLabels2)]
@@ -383,6 +386,7 @@ func TestGroup_Compact_e2e(t *testing.T) {
 			// Check thanos meta.
 			testutil.Assert(t, labels.Equal(extLabels2, labels.FromMap(meta.Thanos.Labels)), "ext labels does not match")
 			testutil.Equals(t, int64(124), meta.Thanos.Downsample.Resolution)
+			testutil.Assert(t, len(meta.Thanos.SegmentFiles) > 0, "compacted blocks have segment files set")
 		}
 	})
 }

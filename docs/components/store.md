@@ -127,7 +127,7 @@ Flags:
                                  Valid duration units are ms, s, m, h, d, w, y.
       --max-time=9999-12-31T23:59:59Z
                                  End of time range limit to serve. Thanos Store
-                                 will serve only blocks, which happened eariler
+                                 will serve only blocks, which happened earlier
                                  than this value. Option can be a constant time
                                  in RFC3339 format or time duration relative to
                                  current time, such as -1d or 2h45m. Valid
@@ -210,6 +210,10 @@ We recommend having overlapping time ranges with Thanos Sidecar and other Thanos
 Thanos Querier deals with overlapping time series by merging them together.
 
 Filtering is done on a Chunk level, so Thanos Store might still return Samples which are outside of `--min-time` & `--max-time`.
+
+### External Label Partitioning (Sharding)
+
+Check more [here](https://thanos.io/tip/thanos/sharding.md/).
 
 ## Probes
 

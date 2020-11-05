@@ -24,14 +24,15 @@ import (
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/relabel"
 	"github.com/prometheus/prometheus/tsdb"
-	tsdberrors "github.com/prometheus/prometheus/tsdb/errors"
+	"golang.org/x/sync/errgroup"
+	"gopkg.in/yaml.v2"
+
 	"github.com/thanos-io/thanos/pkg/block/metadata"
+	"github.com/thanos-io/thanos/pkg/errutil"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	"github.com/thanos-io/thanos/pkg/model"
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/runutil"
-	"golang.org/x/sync/errgroup"
-	"gopkg.in/yaml.v2"
 )
 
 type fetcherMetrics struct {
@@ -257,7 +258,7 @@ func (f *BaseFetcher) loadMeta(ctx context.Context, id ulid.ULID) (*metadata.Met
 		return nil, errors.Wrapf(ErrorSyncMetaCorrupted, "meta.json %v unmarshal: %v", metaFile, err)
 	}
 
-	if m.Version != metadata.MetaVersion1 {
+	if m.Version != metadata.TSDBVersion1 {
 		return nil, errors.Errorf("unexpected meta file: %s version: %d", metaFile, m.Version)
 	}
 
@@ -267,7 +268,7 @@ func (f *BaseFetcher) loadMeta(ctx context.Context, id ulid.ULID) (*metadata.Met
 			level.Warn(f.logger).Log("msg", "best effort mkdir of the meta.json block dir failed; ignoring", "dir", cachedBlockDir, "err", err)
 		}
 
-		if err := metadata.Write(f.logger, cachedBlockDir, m); err != nil {
+		if err := m.WriteToDir(f.logger, cachedBlockDir); err != nil {
 			level.Warn(f.logger).Log("msg", "best effort save of the meta.json to local dir failed; ignoring", "dir", cachedBlockDir, "err", err)
 		}
 	}
@@ -278,7 +279,7 @@ type response struct {
 	metas   map[ulid.ULID]*metadata.Meta
 	partial map[ulid.ULID]error
 	// If metaErr > 0 it means incomplete view, so some metas, failed to be loaded.
-	metaErrs tsdberrors.MultiError
+	metaErrs errutil.MultiError
 
 	noMetas        float64
 	corruptedMetas float64

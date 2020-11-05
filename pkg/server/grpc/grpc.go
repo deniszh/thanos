@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	grpc_health "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 
 	"github.com/thanos-io/thanos/pkg/component"
@@ -66,7 +67,7 @@ func New(logger log.Logger, reg prometheus.Registerer, tracer opentracing.Tracer
 		return status.Errorf(codes.Internal, "%s", p)
 	}
 
-	grpcOpts := []grpc.ServerOption{
+	options.grpcOpts = append(options.grpcOpts, []grpc.ServerOption{
 		grpc.MaxSendMsgSize(math.MaxInt32),
 		grpc_middleware.WithUnaryServerChain(
 			met.UnaryServerInterceptor(),
@@ -78,12 +79,12 @@ func New(logger log.Logger, reg prometheus.Registerer, tracer opentracing.Tracer
 			tracing.StreamServerInterceptor(tracer),
 			grpc_recovery.StreamServerInterceptor(grpc_recovery.WithRecoveryHandler(grpcPanicRecoveryHandler)),
 		),
-	}
+	}...)
 
 	if options.tlsConfig != nil {
-		grpcOpts = append(grpcOpts, grpc.Creds(credentials.NewTLS(options.tlsConfig)))
+		options.grpcOpts = append(options.grpcOpts, grpc.Creds(credentials.NewTLS(options.tlsConfig)))
 	}
-	s := grpc.NewServer(grpcOpts...)
+	s := grpc.NewServer(options.grpcOpts...)
 
 	// Register all configured servers.
 	for _, f := range options.registerServerFuncs {
@@ -94,6 +95,7 @@ func New(logger log.Logger, reg prometheus.Registerer, tracer opentracing.Tracer
 	reg.MustRegister(met)
 
 	grpc_health.RegisterHealthServer(s, probe.HealthServer())
+	reflection.Register(s)
 
 	return &Server{
 		logger: logger,
